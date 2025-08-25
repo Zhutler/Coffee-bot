@@ -1,20 +1,27 @@
+import os
 import re
+import sys
 import logging
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, Defaults
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    filters, ContextTypes, Defaults
+)
 from telegram.constants import ParseMode
 
-# ====== НАСТРОЙКИ ======
-TOKEN = "8478309157:AAH2TD4XVRXKqODQyMncvcyIMSyaZeKn-gA"
-TABLE_NAME = "Калькуляции для GPT"
-# ======================
+# ====== НАСТРОЙКИ ЧЕРЕЗ ENV ======
+TOKEN = os.getenv("BOT_TOKEN")                         # задаёшь в Render → Environment Variables
+TABLE_NAME = os.getenv("TABLE_NAME", "Калькуляции для GPT")
+# путь к секретному файлу; в Render заливай Secret File с таким именем
+SECRET_PATHS = ["/etc/secrets/google_key.json", "google_key.json"]
+# ================================
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bot")
 
-# Нормализация названий колонок и эмодзи для красоты
+# ---- красота для карточек ----
 NAMES_MAP = {
     "СПРАЙТ": ("🥤", "Спрайт", "Основа"),
     "ВОДА С/Г": ("💧", "Вода с/г", "Основа"),
@@ -28,15 +35,26 @@ NAMES_MAP = {
     "(кол-во)": (None, "(кол-во)", None),
 }
 ORDER_GROUPS = ["Основа", "Молочные", "Соки", "Фрукты", "Сиропы", "Добавки", "Прочее"]
+# --------------------------------
 
 def clean_text(text: str) -> str:
     if text is None:
         return ""
     return re.sub(r"[^\w\s]", "", str(text)).strip().lower()
 
+def _find_secret_path() -> str:
+    for p in SECRET_PATHS:
+        if os.path.exists(p):
+            return p
+    raise FileNotFoundError(
+        "google_key.json не найден. Либо добавь Secret File в Render как /etc/secrets/google_key.json, "
+        "либо положи google_key.json рядом с bot.py"
+    )
+
 def connect_sheet():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name("google_key.json", scope)
+    key_path = _find_secret_path()
+    creds = ServiceAccountCredentials.from_json_keyfile_name(key_path, scope)
     client = gspread.authorize(creds)
     return client.open(TABLE_NAME)
 
@@ -89,7 +107,7 @@ def box_table(groups):
             right = val if not qty else f"{val}  ({qty})"
             lines.append(f"│ {left} │ {right}")
         lines.append("│")
-    if lines[-1] == "│":
+    if lines and lines[-1] == "│":
         lines.pop()
     lines.append("└────────────────────────────────────────┘")
     return "\n".join(lines)
@@ -119,20 +137,53 @@ def find_matches_all_tabs(spread, query: str):
                 results.append((sh.title, headers, row, cn))
     return results
 
+def list_by_sheet_query(spread, title_query: str):
+    tq = clean_text(title_query)
+    results = []
+    for sh in spread.worksheets():
+        if tq not in clean_text(sh.title):
+            continue
+        data = sh.get_all_values()
+        if not data:
+            continue
+        headers = data[0]
+        for row in data[1:]:
+            if not row:
+                continue
+            raw = row[0] if len(row) > 0 else ""
+            cn = clean_text(raw)
+            if cn:
+                results.append((sh.title, headers, row, cn))
+    return results
+
 # ─────────── Handlers ───────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Пиши название напитка — пришлю рецепт.\n"
         "Команды:\n"
-        "• /tabs — список вкладок\n"
+        "• /tabs — показать вкладки\n"
+        "• /tabs &lt;категория&gt; — список напитков в категории (пример: <code>/tabs Классика</code>)\n"
         "• /list &lt;слово&gt; — список совпадений (пример: <code>/list мох</code>)\n"
         "• /all &lt;слово&gt; — вывести все совпадения рецептами (пример: <code>/all латте</code>)\n"
-        "Если пришлю список — просто ответь цифрой (1,2,…)."
+        "Если пришлю список — ответь цифрой (1,2,…), и я пришлю карточку рецепта."
     )
 
 async def tabs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     spread = context.bot_data["spread"]
+    if context.args:
+        q = " ".join(context.args)
+        matches = list_by_sheet_query(spread, q)
+        if not matches:
+            titles = [ws.title for ws in spread.worksheets()]
+            return await update.message.reply_text(
+                "Не нашёл такую категорию.\nДоступные вкладки:\n" + "\n".join(f"• {t}" for t in titles)
+            )
+        context.user_data["last_results"] = matches
+        names = [f"{i+1}. {m[2][0]} (🗂 {m[0]})" for i, m in enumerate(matches)]
+        return await update.message.reply_text(
+            f"Напитки в категории «{q}». Выбери номер:\n" + "\n".join(names)
+        )
     titles = [ws.title for ws in spread.worksheets()]
     await update.message.reply_text("Вкладки:\n" + "\n".join(f"• {t}" for t in titles))
 
@@ -172,7 +223,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message.text.strip()
     spread = context.bot_data["spread"]
 
-    # Если прислали номер из списка
     if msg.isdigit():
         idx = int(msg) - 1
         results = context.user_data.get("last_results") or []
@@ -180,19 +230,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sh, headers, row, _ = results[idx]
             return await update.message.reply_text(format_recipe(sh, headers, row))
 
-    # Обычный поиск
     matches = find_matches_all_tabs(spread, msg)
     if not matches:
         return await update.message.reply_text("❌ Напиток не найден.")
-
-    # Точное совпадение — сразу карточка
     q_clean = clean_text(msg)
     exact = [m for m in matches if m[3] == q_clean]
     if exact:
         sh, headers, row, _ = exact[0]
         return await update.message.reply_text(format_recipe(sh, headers, row))
 
-    # Иначе — список для выбора
     context.user_data["last_results"] = matches
     names = [f"{i+1}. {m[2][0]} (🗂 {m[0]})" for i, m in enumerate(matches)]
     if len(names) > 10:
@@ -200,6 +246,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Нашёл несколько вариантов, выбери номер:\n" + "\n".join(names))
 
 def main():
+    if not TOKEN:
+        log.error("BOT_TOKEN не задан. Укажи переменную окружения BOT_TOKEN.")
+        sys.exit(1)
+
     log.info("Подключаюсь к Google Sheet…")
     spread = connect_sheet()
     log.info("Открыт файл: %s", TABLE_NAME)
